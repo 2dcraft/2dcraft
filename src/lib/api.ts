@@ -54,7 +54,7 @@ export const Api = {
     return { id: data.id, username: data.username, created_at: data.created_at };
   },
   logout: async (id: string) => { await db.from('players').update({ presence: 'offline' }).eq('id', id); },
-  heartbeat: async (id: string) => { await db.from('players').update({ presence: 'online', last_seen: new Date().toISOString() }).eq('id', id).catch(() => {}); },
+  heartbeat: async (id: string) => { try { await db.from('players').update({ presence: 'online', last_seen: new Date().toISOString() }).eq('id', id); } catch {} },
 
   listWorlds: async (ownerId: string): Promise<World[]> => {
     const { data, error } = await db.from('worlds').select('id,name,mode,seed,last_played,save_data,created_at').eq('owner_id', ownerId).order('last_played', { ascending: false });
