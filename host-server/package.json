@@ -1,0 +1,15 @@
+{
+  "name": "2dcraft-server",
+  "version": "1.0.0",
+  "description": "2Dcraft Local Server Host — run this on your PC to host a server",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "install-deps": "npm install"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "@supabase/supabase-js": "^2.49.4"
+  }
+}
