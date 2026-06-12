@@ -1,4 +1,5 @@
 import { Api, type Player, type World, type ServerInfo, type FriendRel } from '../lib/api';
+import { hostRoom, joinRoom, leaveRoom, getRoomCode, send } from '../lib/multiplayer';
 import { Icons } from './icons';
 import { initAudio, sfx } from '../game/audio';
 import { RECIPES } from '../game/recipes';
@@ -136,7 +137,7 @@ function showAuth() {
     (app.querySelector('#guestBtn') as HTMLElement).addEventListener('click', async () => {
       initAudio(); sfx('click');
       const name = 'Player' + Math.floor(1000 + Math.random() * 9000);
-      try { const r = await Api.register(name, 'guest-' + Math.random().toString(36).slice(2)); currentPlayer = r.player; saveSession(r.player); startHeartbeat(); showHub(); }
+      try { const r = await Api.register(name, 'guest-' + Math.random().toString(36).slice(2)); currentPlayer = r; saveSession(r); startHeartbeat(); showHub(); }
       catch (e: any) { toast(e.message || 'Could not start', 'bad'); }
     });
 
@@ -147,7 +148,7 @@ function showAuth() {
       btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> …';
       try {
         const r = mode === 'register' ? await Api.register(u, p) : await Api.login(u, p);
-        currentPlayer = r.player; saveSession(r.player); startHeartbeat(); showHub();
+        currentPlayer = r; saveSession(r); startHeartbeat(); showHub();
       } catch (err: any) {
         btn.disabled = false; btn.innerHTML = mode === 'register' ? 'Create & Play' : 'Sign In';
         if (/taken/i.test(err.message)) { field.className = 'mc-field bad'; hint.className = 'mc-hint bad'; hint.innerHTML = `${Icons.x} ${esc(err.message)}`; }
@@ -171,6 +172,11 @@ type HubTab = 'worlds' | 'servers' | 'friends' | 'settings';
 let hubTab: HubTab = 'worlds';
 let friendsData: FriendRel[] = [];
 
+async function refreshFriends() {
+  if (!currentPlayer) return;
+  const main = app.querySelector('#hubMain') as HTMLElement;
+  if (main && hubTab === 'friends') renderFriends(main);
+}
 function showHub() { app.classList.remove('hidden'); renderHub(); refreshFriends(); }
 function presenceCls(p: string) { return p === 'online' ? '' : p === 'away' ? 'away' : 'off'; }
 
@@ -195,7 +201,7 @@ function renderHub() {
 
   app.querySelectorAll('[data-t]').forEach(el => el.addEventListener('click', () => { hubTab = (el as HTMLElement).dataset.t as HubTab; sfx('click'); renderHub(); }));
   (app.querySelector('#logoutBtn') as HTMLElement).addEventListener('click', async () => {
-    sfx('click'); if (currentPlayer) await Api.logout(currentPlayer.id).catch(() => {});
+    sfx('click'); if (currentPlayer) try { await Api.logout(currentPlayer.id); } catch {};
     clearSession(); currentPlayer = null; if (heartbeat) clearInterval(heartbeat); showAuth();
   });
 
@@ -255,108 +261,226 @@ function openCreateWorld(onDone?: (w: World) => void) {
   });
 }
 
-// ----- multiplayer: local host + join by IP -----
+// ----- multiplayer: in-browser host + join -----
 async function renderServers(main: HTMLElement) {
   main.innerHTML = `
-    <div class="sec-head"><div><h2>Multiplayer</h2><p>Host a local server on your PC, or join one by IP</p></div></div>
+    <div class="sec-head"><div><h2>Multiplayer</h2><p>Host or join a game — no download needed</p></div></div>
+
     <div class="list" style="margin-bottom:14px">
-      <div class="lrow" style="background:#a9c6a0">
-        <div class="ic-box" style="color:#3e8b3a">${Icons.home}</div>
+      <div class="lrow" style="background:#a9c6a0;cursor:pointer" id="hostBtn">
+        <div class="ic-box" style="color:#3e8b3a;font-size:22px">🌐</div>
         <div class="grow">
-          <div class="t1">Host a Local Server</div>
-          <div class="t2">Download the server script, run it on your PC, then share your IP with friends</div>
+          <div class="t1">Host a Server</div>
+          <div class="t2">Start a game right now — your friends join with a 6-letter code, no downloads needed</div>
         </div>
-        <button class="mc-btn primary sm" id="dlBtn">${Icons.download ?? '⬇'} Download Server</button>
+        <button class="mc-btn primary sm">${Icons.servers} Host</button>
+      </div>
+    </div>
+
+    <div class="list" style="margin-bottom:14px">
+      <div class="lrow" style="background:#c6d4e8;cursor:pointer" id="joinCodeBtn">
+        <div class="ic-box" style="color:#3a5a8b;font-size:22px">🔑</div>
+        <div class="grow">
+          <div class="t1">Join with Code</div>
+          <div class="t2">Got a 6-letter code from a friend? Enter it here to join their game</div>
+        </div>
+        <button class="mc-btn sm" style="background:#3a5a8b;color:#fff">Join</button>
       </div>
     </div>
     <div class="add-bar">
       <input class="mc-input" id="ipInput" placeholder="Join by IP  (e.g. 192.168.1.10:25565)" />
       <button class="mc-btn sm" id="joinIp">${Icons.link} Join</button>
     </div>
-    <div class="sec-head" style="margin-top:10px"><div><h2 style="font-size:11px">Public Servers</h2><div style="font-size:9px;color:#666;margin-top:2px">Servers open to everyone</div></div></div>
-    <div class="list" id="pubList"><div class="empty"><span class="spinner"></span></div></div>
-    <div class="sec-head" style="margin-top:6px"><div><h2 style="font-size:11px">My Hosted Servers</h2></div></div>
-    <div class="list" id="srvList"><div class="empty"><span class="spinner"></span></div></div>`;
+    <div class="sec-head" style="margin-top:6px"><div><h2 style="font-size:11px">Public Servers</h2><div style="font-size:9px;color:#666;margin-top:2px">Live games open to everyone</div></div></div>
+    <div class="list" id="pubList"><div class="empty"><span class="spinner"></span></div></div>`;
 
-  // Download server script
-  (main.querySelector('#dlBtn') as HTMLElement).addEventListener('click', () => {
-    sfx('click');
-    window.open('https://github.com/2dcraft/server/releases/latest', '_blank');
-    toast('Opening server download page!', 'good');
-  });
+  // ── HOST button ──────────────────────────────────────────────
+  (main.querySelector('#hostBtn') as HTMLElement).addEventListener('click', () => { sfx('click'); openHostModal(main); });
 
-  // Join by IP
-  const ipInput = main.querySelector('#ipInput') as HTMLInputElement;
-  const doJoin = async () => {
-    const ip = ipInput.value.trim(); if (!ip) return; sfx('click');
-    try {
-      // Try to look up in DB first, then just connect directly
-      let serverInfo: any;
-      try { serverInfo = await Api.serverByIp(ip); } catch { serverInfo = { name: ip, mode: 'survival', seed: hashSeed(ip), host: '?' }; }
-      const w = await Api.createWorld(currentPlayer!.id, (serverInfo.name || ip) + ' (joined)', serverInfo.mode || 'survival', serverInfo.seed ?? hashSeed(ip));
-      enterWorld(w, `Connected to ${maskIp(ip)}`);
-    } catch (e: any) { toast(e.message || 'Could not connect', 'bad'); }
-  };
-  (main.querySelector('#joinIp') as HTMLElement).addEventListener('click', doJoin);
-  ipInput.addEventListener('keydown', e => { if (e.key === 'Enter') doJoin(); });
+  // ── JOIN WITH CODE button ────────────────────────────────────
+  (main.querySelector('#joinCodeBtn') as HTMLElement).addEventListener('click', () => { sfx('click'); openJoinModal(main); });
 
-  // Public server list
+  // ── Public server list ───────────────────────────────────────
   const pubList = main.querySelector('#pubList') as HTMLElement;
   try {
     const pubServers = await Api.listPublicServers();
-    if (!pubServers.length) { pubList.innerHTML = `<div class="empty">No public servers running right now</div>`; }
-    else {
+    if (!pubServers.length) {
+      pubList.innerHTML = `<div class="empty">No public games right now — be the first to host one!</div>`;
+    } else {
       pubList.innerHTML = '';
       for (const s of pubServers) {
         const row = document.createElement('div'); row.className = 'lrow';
         row.innerHTML = `
-          <div class="ic-box" style="color:#3e8b3a">${Icons.servers}</div>
+          <div class="ic-box" style="font-size:20px">🌐</div>
           <div class="grow">
             <div class="t1">${esc(s.name)} <span class="pill ${s.mode}">${s.mode}</span></div>
-            <div class="t2">Host: <b>${esc(s.host)}</b> · IP: <b style="color:#2a5a2a">${esc(maskIp(s.ip || ''))}</b> · ${s.players ?? 0}/${s.max_players} players</div>
+            <div class="t2">Host: <b>${esc(s.host)}</b> · ${s.players ?? 1}/${s.max_players} players · Code: <b style="color:#3a5a8b;font-family:monospace">${esc(s.room_code || '------')}</b></div>
           </div>
           <button class="mc-btn sm" data-act="join">${Icons.play} Join</button>`;
         (row.querySelector('[data-act="join"]') as HTMLElement).addEventListener('click', async () => {
           sfx('click');
-          try {
-            const w = await Api.createWorld(currentPlayer!.id, s.name + ' (joined)', s.mode, s.seed);
-            enterWorld(w, `On ${s.host}'s server`);
-          } catch (e: any) { toast(e.message || 'Could not join', 'bad'); }
+          if (!s.room_code) { toast('This server has no room code', 'bad'); return; }
+          await doJoinWithCode(s.room_code, s);
         });
         pubList.appendChild(row);
       }
     }
-  } catch { pubList.innerHTML = `<div class="empty">Could not load public servers</div>`; }
+  } catch { pubList.innerHTML = `<div class="empty">Could not load servers</div>`; }
+}
 
-  // My hosted servers
-  const list = main.querySelector('#srvList') as HTMLElement;
-  try {
-    const servers = await Api.myServers(currentPlayer!.id);
-    if (!servers.length) { list.innerHTML = `<div class="empty">No hosted servers — run the server script on your PC and it appears here.</div>`; return; }
-    list.innerHTML = '';
-    for (const s of servers) {
-      const row = document.createElement('div'); row.className = 'lrow';
-      row.innerHTML = `
-        <div class="ic-box" style="color:#3e8b3a">${Icons.servers}</div>
-        <div class="grow"><div class="t1">${esc(s.name)} <span class="pill ${s.mode}">${s.mode}</span></div>
-          <div class="t2">IP: <b style="color:#2a5a2a">${esc(maskIp(s.ip || ''))}</b> · ${s.players ?? 0}/${s.max_players} players</div></div>
-        <div class="actions">
-          <button class="iconbtn" title="Copy IP" data-act="copy">${Icons.copy}</button>
-          <button class="iconbtn" title="Play" data-act="play">${Icons.play}</button>
-          <button class="iconbtn red" title="Delete" data-act="del">${Icons.trash}</button>
-        </div>`;
-      (row.querySelector('[data-act="copy"]') as HTMLElement).addEventListener('click', () => { navigator.clipboard?.writeText(s.ip || ''); toast('IP copied!', 'good'); sfx('click'); });
-      (row.querySelector('[data-act="play"]') as HTMLElement).addEventListener('click', async () => {
-        sfx('click');
-        const worlds = await Api.listWorlds(currentPlayer!.id);
-        const w = s.world_id ? worlds.find(x => x.id === s.world_id) : null;
-        if (w) enterWorld(w, `Joining ${s.name} @ ${maskIp(s.ip || '')}`);
-        else { const nw = await Api.createWorld(currentPlayer!.id, s.name + ' (joined)', s.mode, s.seed); enterWorld(nw, `Joining ${s.name}`); }
+// ── Host modal ───────────────────────────────────────────────────
+function openHostModal(main: HTMLElement) {
+  let mode: 'survival' | 'creative' = 'survival';
+  const bg = document.createElement('div'); bg.className = 'modal-bg';
+  bg.innerHTML = `<div class="mc-panel modal">
+    <div class="mc-h">🌐 Host a Game</div>
+    <div class="mc-sub">Your friends join with a 6-letter code — no downloads, no IP addresses, works from any browser.</div>
+    <div class="mc-field"><label>Server Name</label><input class="mc-input" id="sn" placeholder="${esc(currentPlayer!.username)}'s World" maxlength="40" /></div>
+    <label style="font-size:11px;color:#3f3f3f;font-weight:700;font-family:'PressStart',monospace">Mode</label>
+    <div class="seg" style="margin:6px 0 14px"><div class="opt active" data-mode="survival">Survival</div><div class="opt" data-mode="creative">Creative</div></div>
+    <div class="mc-field"><label>Max Players</label><input class="mc-input" id="mp" value="8" type="number" min="2" max="20" /></div>
+    <label style="font-size:11px;color:#3f3f3f;font-weight:700;font-family:'PressStart',monospace">Visibility</label>
+    <div class="seg" style="margin:6px 0 14px"><div class="opt active" data-vis="public">Public (anyone can join)</div><div class="opt" data-vis="private">Private (code only)</div></div>
+    <div class="mc-row"><button class="mc-btn" id="cx">Cancel</button><button class="mc-btn primary" id="ok">🚀 Start Server</button></div>
+  </div>`;
+  document.body.appendChild(bg);
+
+  let isPublic = true;
+  bg.querySelectorAll('[data-mode]').forEach(el => el.addEventListener('click', () => {
+    bg.querySelectorAll('[data-mode]').forEach(x => x.classList.remove('active'));
+    el.classList.add('active'); mode = (el as HTMLElement).dataset.mode as any; sfx('hover');
+  }));
+  bg.querySelectorAll('[data-vis]').forEach(el => el.addEventListener('click', () => {
+    bg.querySelectorAll('[data-vis]').forEach(x => x.classList.remove('active'));
+    el.classList.add('active'); isPublic = (el as HTMLElement).dataset.vis === 'public'; sfx('hover');
+  }));
+  bg.addEventListener('click', e => { if (e.target === bg) bg.remove(); });
+  (bg.querySelector('#cx') as HTMLElement).addEventListener('click', () => { sfx('click'); bg.remove(); });
+
+  (bg.querySelector('#ok') as HTMLElement).addEventListener('click', async () => {
+    const name = (bg.querySelector('#sn') as HTMLInputElement).value.trim() || `${currentPlayer!.username}'s World`;
+    const maxPlayers = parseInt((bg.querySelector('#mp') as HTMLInputElement).value) || 8;
+    const okBtn = bg.querySelector('#ok') as HTMLButtonElement;
+    okBtn.disabled = true; okBtn.textContent = 'Starting…';
+    sfx('click');
+    try {
+      const seed = Math.floor(Math.random() * 1e9);
+      const w = await Api.createWorld(currentPlayer!.id, name, mode, seed);
+      const srv = await Api.createServer({
+        ownerId: currentPlayer!.id, name, host: currentPlayer!.username,
+        mode, seed, maxPlayers, world_id: w.id, isPublic,
       });
-      (row.querySelector('[data-act="del"]') as HTMLElement).addEventListener('click', async () => { sfx('click'); if (confirm(`Remove "${s.name}" from list?`)) { await Api.deleteServer(s.id); renderServers(main); } });
-      list.appendChild(row);
+
+      // Start the in-browser relay
+      const code = await hostRoom({
+        serverId: srv.id,
+        player: { id: currentPlayer!.id, username: currentPlayer!.username },
+        onEvent: (msg, players) => {
+          if (msg.type === 'player_join') toast(`${msg.username} joined!`, 'good');
+          if (msg.type === 'player_leave') toast(`${msg.username} left`);
+        },
+      });
+
+      bg.remove();
+      showRoomCode(code, srv, w);
+    } catch (e: any) {
+      toast(e.message || 'Failed to start server', 'bad');
+      okBtn.disabled = false; okBtn.textContent = '🚀 Start Server';
     }
-  } catch (e: any) { list.innerHTML = `<div class="empty">Failed to load: ${esc(e.message)}</div>`; }
+  });
+}
+
+// ── Room code display (after hosting) ───────────────────────────
+function showRoomCode(code: string, srv: any, w: any) {
+  const bg = document.createElement('div'); bg.className = 'modal-bg';
+  bg.innerHTML = `<div class="mc-panel modal" style="text-align:center">
+    <div class="mc-h">✅ Server Running!</div>
+    <div class="mc-sub">Share this code with your friends — they enter it in the game to join you instantly.</div>
+    <div style="font-size:42px;font-family:'PressStart',monospace;letter-spacing:8px;color:#2a5a2a;background:#e8f5e9;border:2px solid #2a5a2a;border-radius:8px;padding:16px 24px;margin:20px 0;cursor:pointer" id="codeBox">${code}</div>
+    <div style="font-size:11px;color:#888;margin-bottom:20px">Click the code to copy it</div>
+    <div class="mc-row" style="justify-content:center">
+      <button class="mc-btn" id="stopBtn">⏹ Stop Server</button>
+      <button class="mc-btn primary" id="playBtn">▶ Play Now</button>
+    </div>
+  </div>`;
+  document.body.appendChild(bg);
+
+  (bg.querySelector('#codeBox') as HTMLElement).addEventListener('click', () => {
+    navigator.clipboard?.writeText(code);
+    toast('Code copied! Send it to your friends', 'good');
+    sfx('click');
+  });
+
+  (bg.querySelector('#stopBtn') as HTMLElement).addEventListener('click', async () => {
+    sfx('click');
+    await leaveRoom();
+    await Api.deleteServer(srv.id);
+    bg.remove();
+    toast('Server stopped');
+  });
+
+  (bg.querySelector('#playBtn') as HTMLElement).addEventListener('click', () => {
+    sfx('click');
+    bg.remove();
+    enterWorld(w, `Hosting "${srv.name}" · Code: ${code}`);
+  });
+}
+
+// ── Join with code modal ─────────────────────────────────────────
+function openJoinModal(main: HTMLElement) {
+  const bg = document.createElement('div'); bg.className = 'modal-bg';
+  bg.innerHTML = `<div class="mc-panel modal">
+    <div class="mc-h">🔑 Join a Game</div>
+    <div class="mc-sub">Enter the 6-letter code your friend gave you.</div>
+    <div class="mc-field">
+      <label>Room Code</label>
+      <input class="mc-input" id="codeInput" placeholder="e.g. ABC123" maxlength="6"
+        style="font-size:24px;letter-spacing:6px;text-align:center;font-family:monospace;text-transform:uppercase" />
+    </div>
+    <div class="mc-row"><button class="mc-btn" id="cx">Cancel</button><button class="mc-btn primary" id="ok">🔑 Join</button></div>
+  </div>`;
+  document.body.appendChild(bg);
+
+  const codeInput = bg.querySelector('#codeInput') as HTMLInputElement;
+  codeInput.addEventListener('input', () => { codeInput.value = codeInput.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
+  bg.addEventListener('click', e => { if (e.target === bg) bg.remove(); });
+  (bg.querySelector('#cx') as HTMLElement).addEventListener('click', () => { sfx('click'); bg.remove(); });
+
+  const doJoin = async () => {
+    const code = codeInput.value.trim().toUpperCase();
+    if (code.length < 4) { toast('Enter a valid room code', 'bad'); return; }
+    const okBtn = bg.querySelector('#ok') as HTMLButtonElement;
+    okBtn.disabled = true; okBtn.textContent = 'Joining…'; sfx('click');
+    try {
+      // Look up server info by room code
+      const { data: srv } = await import('../lib/api').then(m =>
+        m.db.from('game_servers').select('*').eq('room_code', code).maybeSingle()
+      );
+      if (!srv) throw new Error('No server found with that code — check it and try again');
+      await doJoinWithCode(code, srv);
+      bg.remove();
+    } catch (e: any) {
+      toast(e.message || 'Could not join', 'bad');
+      okBtn.disabled = false; okBtn.textContent = '🔑 Join';
+    }
+  };
+  (bg.querySelector('#ok') as HTMLElement).addEventListener('click', doJoin);
+  codeInput.addEventListener('keydown', e => { if (e.key === 'Enter') doJoin(); });
+  setTimeout(() => codeInput.focus(), 100);
+}
+
+// ── Shared join logic ────────────────────────────────────────────
+async function doJoinWithCode(code: string, srv: any) {
+  const w = await Api.createWorld(currentPlayer!.id, srv.name + ' (joined)', srv.mode, srv.seed);
+  await joinRoom({
+    roomCode: code,
+    player: { id: currentPlayer!.id, username: currentPlayer!.username },
+    onEvent: (msg, players) => {
+      if (msg.type === 'player_join') toast(`${msg.username} joined`);
+      if (msg.type === 'player_leave') toast(`${msg.username} left`);
+    },
+  });
+  enterWorld(w, `In ${srv.host}'s game · Code: ${code}`);
 }
 
 function renderFriends(main: HTMLElement) {
@@ -372,7 +496,7 @@ function renderFriends(main: HTMLElement) {
     <div style="font-size:10px;color:#3f3f3f;font-family:'PressStart',monospace;margin:14px 0 6px">ALL FRIENDS</div>
     <div class="list" id="fr"></div>`;
   const ai = main.querySelector('#ai') as HTMLInputElement;
-  const add = async () => { const u = ai.value.trim(); if (!u) return; sfx('click'); try { const r = await Api.addFriend(currentPlayer!.id, u); toast(`Request sent to ${r.username}`, 'good'); ai.value = ''; await refreshFriends(); } catch (e: any) { toast(e.message, 'bad'); } };
+  const add = async () => { const u = ai.value.trim(); if (!u) return; sfx('click'); try { await Api.addFriend(currentPlayer!.id, u); toast(`Friend request sent to ${u}`, 'good'); ai.value = ''; await refreshFriends(); } catch (e: any) { toast(e.message, 'bad'); } };
   (main.querySelector('#ab') as HTMLElement).addEventListener('click', add);
   ai.addEventListener('keydown', e => { if (e.key === 'Enter') add(); });
 
